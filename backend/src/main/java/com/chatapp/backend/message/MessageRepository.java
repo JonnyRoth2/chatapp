@@ -21,7 +21,20 @@ public interface MessageRepository extends JpaRepository<Message, Long> {
             """)
     List<Message> findConversation(@Param("a") User a, @Param("b") User b, @Param("cutoff") Instant cutoff);
 
+    /** Group conversation; no fetch join on recipient — it's null for group rows. */
+    @Query("""
+            select m from Message m
+            join fetch m.sender
+            where m.group.id = :groupId and m.createdAt > :cutoff
+            order by m.createdAt asc
+            """)
+    List<Message> findGroupConversation(@Param("groupId") Long groupId, @Param("cutoff") Instant cutoff);
+
     @Modifying
     @Query("delete from Message m where m.createdAt < :cutoff")
     int deleteOlderThan(@Param("cutoff") Instant cutoff);
+
+    @Modifying
+    @Query("delete from Message m where m.group.id = :groupId")
+    int deleteByGroupId(@Param("groupId") Long groupId);
 }

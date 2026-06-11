@@ -20,18 +20,22 @@ public class MessagePurgeJob {
     private static final Logger log = LoggerFactory.getLogger(MessagePurgeJob.class);
 
     private final MessageRepository messageRepository;
+    private final MessageImageRepository imageRepository;
     private final Duration ttl;
 
-    public MessagePurgeJob(MessageRepository messageRepository,
+    public MessagePurgeJob(MessageRepository messageRepository, MessageImageRepository imageRepository,
                            @Value("${app.messages.ttl-hours}") long ttlHours) {
         this.messageRepository = messageRepository;
+        this.imageRepository = imageRepository;
         this.ttl = Duration.ofHours(ttlHours);
     }
 
     @Scheduled(fixedRateString = "${app.messages.purge-rate-ms}")
     @Transactional
     public void purgeExpired() {
-        int deleted = messageRepository.deleteOlderThan(Instant.now().minus(ttl));
+        Instant cutoff = Instant.now().minus(ttl);
+        imageRepository.deleteForMessagesOlderThan(cutoff); // FK: images first
+        int deleted = messageRepository.deleteOlderThan(cutoff);
         if (deleted > 0) {
             log.info("Purged {} expired messages", deleted);
         }
