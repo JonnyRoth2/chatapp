@@ -149,9 +149,10 @@ public class MessageService {
         return Instant.now().minus(ttl);
     }
 
+    // Large cap: E2E ciphertext is several KB. Plaintext UI still limits to 2000.
     private void validateContent(String content) {
-        if (content == null || content.isBlank() || content.length() > 2000) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Message must be 1-2000 characters");
+        if (content == null || content.isBlank() || content.length() > 20000) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Message too long");
         }
     }
 

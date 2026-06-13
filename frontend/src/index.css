@@ -231,6 +231,18 @@ button.link.danger:hover { color: var(--error); }
 }
 .member-add input { width: 170px; font-size: 0.85em; }
 
+.safety {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.4rem 0.2rem 0;
+}
+.safety code {
+  color: var(--bright);
+  letter-spacing: 1px;
+  font-size: 0.9em;
+}
+
 .contact-list.groups { flex: 0 1 auto; }
 .status { font-size: 0.8em; }
 .status.on { color: var(--ok); }

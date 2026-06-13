@@ -45,7 +45,9 @@ public class Message {
     @JoinColumn(name = "group_id")
     private GroupChat group;
 
-    @Column(nullable = false, length = 2000)
+    // TEXT: holds either plaintext (groups) or base64 ratchet ciphertext (E2E DMs),
+    // which is several KB once ML-KEM keys are included.
+    @Column(nullable = false, columnDefinition = "TEXT")
     private String content;
 
     @Column(nullable = false)

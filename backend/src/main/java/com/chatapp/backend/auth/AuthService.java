@@ -48,7 +48,7 @@ public class AuthService {
 
     private AuthResponse toResponse(User user) {
         return new AuthResponse(jwtService.generateToken(user.getUsername()),
-                user.getUsername(), user.getAdditionKey());
+                user.getId(), user.getUsername(), user.getAdditionKey());
     }
 
     private String generateUniqueKey() {
@@ -65,5 +65,5 @@ public class AuthService {
         throw new IllegalStateException("Could not generate a unique addition key");
     }
 
-    public record AuthResponse(String token, String username, String additionKey) {}
+    public record AuthResponse(String token, Long userId, String username, String additionKey) {}
 }
