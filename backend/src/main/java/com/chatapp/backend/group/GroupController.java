@@ -1,10 +1,13 @@
 package com.chatapp.backend.group;
 
 import com.chatapp.backend.message.MessageImageRepository;
+import com.chatapp.backend.message.MessageKeyEnvelopeRepository;
 import com.chatapp.backend.message.MessageRepository;
 import com.chatapp.backend.message.MessageService;
 import com.chatapp.backend.user.User;
 import com.chatapp.backend.user.UserRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -26,6 +29,7 @@ import org.springframework.web.server.ResponseStatusException;
 import java.io.IOException;
 import java.security.Principal;
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/groups")
@@ -37,11 +41,14 @@ public class GroupController {
     private final MessageService messageService;
     private final MessageRepository messageRepository;
     private final MessageImageRepository imageRepository;
+    private final MessageKeyEnvelopeRepository envelopeRepository;
+    private final ObjectMapper objectMapper;
     private final int maxMembers;
 
     public GroupController(GroupChatRepository groupRepository, GroupMemberRepository memberRepository,
                            UserRepository userRepository, MessageService messageService,
                            MessageRepository messageRepository, MessageImageRepository imageRepository,
+                           MessageKeyEnvelopeRepository envelopeRepository, ObjectMapper objectMapper,
                            @Value("${app.groups.max-members}") int maxMembers) {
         this.groupRepository = groupRepository;
         this.memberRepository = memberRepository;
@@ -49,6 +56,8 @@ public class GroupController {
         this.messageService = messageService;
         this.messageRepository = messageRepository;
         this.imageRepository = imageRepository;
+        this.envelopeRepository = envelopeRepository;
+        this.objectMapper = objectMapper;
         this.maxMembers = maxMembers;
     }
 
@@ -127,8 +136,9 @@ public class GroupController {
         purgeGroup(groupId);
     }
 
-    /** FK order: images -> messages -> members -> group. */
+    /** FK order: key envelopes -> images -> messages -> members -> group. */
     private void purgeGroup(Long groupId) {
+        envelopeRepository.deleteForGroup(groupId);
         imageRepository.deleteForGroup(groupId);
         messageRepository.deleteByGroupId(groupId);
         memberRepository.deleteByGroupId(groupId);
@@ -140,13 +150,17 @@ public class GroupController {
         return messageService.groupHistory(principal.getName(), groupId);
     }
 
+    /** Encrypted group image: {@code file} is the ciphertext, {@code envelopes} a
+     *  JSON map of each member's userId to their wrapped content key. */
     @PostMapping("/{groupId}/image")
     public MessageService.MessageDto sendImage(@PathVariable Long groupId,
                                                @RequestParam("file") MultipartFile file,
+                                               @RequestParam("envelopes") String envelopesJson,
                                                Principal principal) {
         try {
-            return messageService.sendGroupImage(principal.getName(), groupId,
-                    file.getContentType(), file.getBytes());
+            Map<Long, String> envelopes =
+                    objectMapper.readValue(envelopesJson, new TypeReference<Map<Long, String>>() {});
+            return messageService.sendGroupImage(principal.getName(), groupId, file.getBytes(), envelopes);
         } catch (IOException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Could not read uploaded file");
         }

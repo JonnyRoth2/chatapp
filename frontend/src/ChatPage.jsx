@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { Client } from '@stomp/stompjs';
-import { api, apiUpload, fetchImageObjectUrl, setAuth, WS_URL } from './api';
+import { api, apiUpload, fetchImageBytes, setAuth, WS_URL } from './api';
 import { createE2E, safetyNumber } from './crypto/e2e';
 import { idbStore } from './crypto/idbStore';
 import { concat, toB64, fromB64 } from './crypto/primitives';
+import { sealContent, openContent, frameImage, unframeImage } from './crypto/content';
 import { sha256 } from '@noble/hashes/sha2.js';
 
 const te = new TextEncoder();
@@ -13,18 +14,30 @@ function fmtTime(iso) {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-/** <img> can't carry an Authorization header, so fetch with the JWT instead. */
-function AuthImage({ messageId }) {
+/**
+ * Images are stored encrypted; the bytes need both the JWT (to fetch) and the
+ * per-image content key (cached in IndexedDB under the message id) to decrypt.
+ */
+function AuthImage({ messageId, username }) {
   const [url, setUrl] = useState(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     let objectUrl = null;
     let cancelled = false;
-    fetchImageObjectUrl(messageId)
-      .then((u) => { if (cancelled) URL.revokeObjectURL(u); else { objectUrl = u; setUrl(u); } })
-      .catch(() => !cancelled && setFailed(true));
+    (async () => {
+      try {
+        const cek = await idbStore.getContentKey(username, messageId);
+        if (!cek) throw new Error('no content key');
+        const enc = await fetchImageBytes(messageId);
+        const { contentType, bytes } = unframeImage(openContent(cek, enc));
+        objectUrl = URL.createObjectURL(new Blob([bytes], { type: contentType }));
+        if (cancelled) URL.revokeObjectURL(objectUrl); else setUrl(objectUrl);
+      } catch {
+        if (!cancelled) setFailed(true);
+      }
+    })();
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [messageId]);
+  }, [messageId, username]);
   if (failed) return <span className="muted">[image unavailable]</span>;
   if (!url) return <span className="muted">[loading image…]</span>;
   return <img className="chat-image" src={url} alt="shared image" />;
@@ -33,19 +46,8 @@ function AuthImage({ messageId }) {
 const dmKey = (userId) => `dm-${userId}`;
 const groupKey = (groupId) => `g-${groupId}`;
 const convKey = (conv) => (conv.kind === 'dm' ? dmKey(conv.userId) : groupKey(conv.id));
-
-// Normalize a server group message into the unified display shape.
-function normalizeGroup(m, myName) {
-  return {
-    id: m.id,
-    mine: m.senderUsername === myName,
-    senderUsername: m.senderUsername,
-    type: m.type === 'IMAGE' ? 'image' : 'text',
-    content: m.content,
-    imageId: m.type === 'IMAGE' ? m.id : null,
-    createdAt: m.createdAt,
-  };
-}
+// IndexedDB conversation key for a group's local history / processed-id tracking.
+const groupPeer = (groupId) => `g${groupId}`;
 
 export default function ChatPage({ auth, onLogout }) {
   const [contacts, setContacts] = useState([]);
@@ -112,32 +114,46 @@ export default function ChatPage({ auth, onLogout }) {
     else setUnread((prev) => ({ ...prev, [key]: (prev[key] || 0) + 1 }));
   }
 
-  async function handleIncoming(msg) {
-    // ---- group messages: plaintext (not E2E in this version) ----
-    if (msg.groupId != null) {
-      route(groupKey(msg.groupId), null, normalizeGroup(msg, auth.username));
-      return;
-    }
-    // ---- direct messages: end-to-end encrypted ----
-    if (msg.senderId === auth.userId) return; // our own echo; shown optimistically
-    await e2eReadyRef.current;
-    if (await idbStore.isProcessed(auth.username, msg.senderId, msg.id)) return;
-
-    let text;
+  // Decrypt one server message into a display row. Images: unwrap the content
+  // key and cache it (the bytes are fetched lazily on render). Group text: unwrap
+  // the key, then open the blob. DM text: ratchet wire carried directly in content.
+  // NOTE: decrypting advances the ratchet, so each message must be passed here at
+  // most once — callers guard with idbStore.isProcessed.
+  async function decryptMessage(msg) {
+    const base = { id: msg.id, mine: false, senderUsername: msg.senderUsername, createdAt: msg.createdAt };
     try {
-      const wire = JSON.parse(msg.content);
-      text = td.decode(await e2eRef.current.decrypt(msg.senderId, wire));
-    } catch (e) {
-      text = '[unable to decrypt]';
+      if (msg.type === 'IMAGE') {
+        const cek = await e2eRef.current.decrypt(msg.senderId, JSON.parse(msg.envelope));
+        await idbStore.setContentKey(auth.username, msg.id, cek);
+        return { ...base, type: 'image', imageId: msg.id };
+      }
+      let text;
+      if (msg.groupId != null) {
+        const cek = await e2eRef.current.decrypt(msg.senderId, JSON.parse(msg.envelope));
+        text = td.decode(openContent(cek, fromB64(msg.content)));
+      } else {
+        text = td.decode(await e2eRef.current.decrypt(msg.senderId, JSON.parse(msg.content)));
+      }
+      return { ...base, type: 'text', content: text };
+    } catch {
+      return { ...base, type: 'text', content: '[unable to decrypt]' };
     }
-    const display = {
-      id: msg.id, mine: false, senderUsername: msg.senderUsername,
-      type: 'text', content: text, createdAt: msg.createdAt,
-    };
-    await idbStore.appendMessage(auth.username, msg.senderId, { serverId: msg.id, ...display });
-    route(dmKey(msg.senderId), msg.senderId, display);
   }
 
+  async function handleIncoming(msg) {
+    if (msg.senderId === auth.userId) return; // our own echo; shown optimistically
+    await e2eReadyRef.current;
+    const isGroup = msg.groupId != null;
+    const peer = isGroup ? groupPeer(msg.groupId) : msg.senderId;
+    if (await idbStore.isProcessed(auth.username, peer, msg.id)) return;
+    const display = await decryptMessage(msg);
+    await idbStore.appendMessage(auth.username, peer, { serverId: msg.id, ...display });
+    route(isGroup ? groupKey(msg.groupId) : dmKey(msg.senderId), null, display);
+  }
+
+  // Decrypt any unprocessed server messages (offline delivery), persist them to
+  // local history, then show local history. Works for both DMs and groups; the
+  // server only ever holds ciphertext, so plaintext lives only on the client.
   async function openConversation(conv) {
     setActive(conv);
     setError('');
@@ -146,35 +162,24 @@ export default function ChatPage({ auth, onLogout }) {
     setSafety(null);
     setUnread((prev) => ({ ...prev, [convKey(conv)]: 0 }));
 
-    if (conv.kind === 'group') {
-      try {
-        const raw = await api(`/api/groups/${conv.id}/messages`);
-        setMessages(raw.map((m) => normalizeGroup(m, auth.username)));
-      } catch (e) { setError(e.message); }
-      return;
-    }
-
-    // DM: decrypt any unprocessed server messages (offline delivery), then show local history.
     await e2eReadyRef.current;
+    const isGroup = conv.kind === 'group';
+    const peer = isGroup ? groupPeer(conv.id) : conv.userId;
+    const path = isGroup ? `/api/groups/${conv.id}/messages` : `/api/messages/${conv.userId}`;
+
     try {
-      const raw = await api(`/api/messages/${conv.userId}`);
+      const raw = await api(path);
       for (const m of raw) {
-        if (m.senderId === auth.userId) continue;       // our own — already stored locally
-        if (m.type === 'IMAGE') continue;               // encrypted images: next step
-        if (await idbStore.isProcessed(auth.username, conv.userId, m.id)) continue;
-        try {
-          const pt = await e2eRef.current.decrypt(conv.userId, JSON.parse(m.content));
-          await idbStore.appendMessage(auth.username, conv.userId, {
-            serverId: m.id, id: m.id, mine: false, senderUsername: m.senderUsername,
-            type: 'text', content: td.decode(pt), createdAt: m.createdAt,
-          });
-        } catch { /* skip undecryptable */ }
+        if (m.senderId === auth.userId) continue;                  // our own — stored locally at send
+        if (await idbStore.isProcessed(auth.username, peer, m.id)) continue;
+        const display = await decryptMessage(m);
+        await idbStore.appendMessage(auth.username, peer, { serverId: m.id, ...display });
       }
     } catch (e) { setError(e.message); }
 
-    const h = await idbStore.getHistory(auth.username, conv.userId);
+    const h = await idbStore.getHistory(auth.username, peer);
     setMessages([...h.messages].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)));
-    computeSafety(conv.userId);
+    if (!isGroup) computeSafety(conv.userId);
   }
 
   async function computeSafety(peerId) {
@@ -192,10 +197,29 @@ export default function ChatPage({ auth, onLogout }) {
     setDraft('');
 
     if (active.kind === 'group') {
-      clientRef.current.publish({
-        destination: '/app/chat',
-        body: JSON.stringify({ groupId: active.id, content }),
-      });
+      // Seal once under a content key; wrap that key for each member; store
+      // plaintext locally and broadcast only ciphertext + per-member envelopes.
+      try {
+        await e2eReadyRef.current;
+        const recipientIds = active.members.map((m) => m.userId).filter((id) => id !== auth.userId);
+        const { cek, ciphertext } = sealContent(te.encode(content));
+        const envelopes = {};
+        for (const rid of recipientIds) {
+          // Best-effort: a member who hasn't published keys yet just misses this one.
+          try { envelopes[rid] = await e2eRef.current.encrypt(rid, cek); }
+          catch { /* skip unreachable member */ }
+        }
+        const display = {
+          id: `local-${Date.now()}`, mine: true, senderUsername: auth.username,
+          type: 'text', content, createdAt: new Date().toISOString(),
+        };
+        await idbStore.appendMessage(auth.username, groupPeer(active.id), display);
+        setMessages((prev) => [...prev, display]);
+        clientRef.current.publish({
+          destination: '/app/chat',
+          body: JSON.stringify({ groupId: active.id, content: toB64(ciphertext), envelopes }),
+        });
+      } catch (err) { setError('send failed: ' + err.message); }
       return;
     }
 
@@ -218,14 +242,47 @@ export default function ChatPage({ auth, onLogout }) {
     }
   }
 
+  // Encrypt an image (DM or group) under a content key, wrap the key per
+  // recipient, upload only ciphertext, and show it optimistically.
   async function sendImage(e) {
     const file = e.target.files?.[0];
     e.target.value = '';
-    if (!file || !active || active.kind !== 'group') return; // DM images: next step
+    if (!file || !active) return;
     if (file.size > 5 * 1024 * 1024) { setError('Image too large (max 5MB)'); return; }
     setError('');
     try {
-      await apiUpload(`/api/groups/${active.id}/image`, file);
+      await e2eReadyRef.current;
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const { cek, ciphertext } = sealContent(frameImage(file.type, bytes));
+      const encFile = new File([ciphertext], 'img.enc', { type: 'application/octet-stream' });
+
+      const isGroup = active.kind === 'group';
+      const recipientIds = isGroup
+        ? active.members.map((m) => m.userId).filter((id) => id !== auth.userId)
+        : [active.userId];
+      const envelopes = {};
+      for (const rid of recipientIds) {
+        try {
+          envelopes[rid] = await e2eRef.current.encrypt(rid, cek);
+        } catch (err) {
+          if (!isGroup) throw err; // a DM peer must have keys; surface the failure
+          // group: a member with no keys yet simply won't receive this image
+        }
+      }
+
+      const dto = isGroup
+        ? await apiUpload(`/api/groups/${active.id}/image`, encFile, { envelopes: JSON.stringify(envelopes) })
+        : await apiUpload(`/api/messages/${active.userId}/image`, encFile, { envelope: envelopes[active.userId] });
+
+      // Cache our own content key so we can render the image we just sent.
+      await idbStore.setContentKey(auth.username, dto.id, cek);
+      const peer = isGroup ? groupPeer(active.id) : active.userId;
+      const display = {
+        serverId: dto.id, id: dto.id, mine: true, senderUsername: auth.username,
+        type: 'image', imageId: dto.id, createdAt: dto.createdAt,
+      };
+      await idbStore.appendMessage(auth.username, peer, display);
+      setMessages((prev) => [...prev, display]);
     } catch (err) { setError(err.message); }
   }
 
@@ -330,7 +387,7 @@ export default function ChatPage({ auth, onLogout }) {
           {contacts.length === 0 && <li className="muted small empty">// no contacts yet — share your key</li>}
         </ul>
 
-        <div className="section-label">── groups (plaintext) ──</div>
+        <div className="section-label">── groups (e2e 🔒) ──</div>
         <form className="add-contact" onSubmit={createGroup}>
           <span className="prompt">#</span>
           <input placeholder="new group name" value={newGroupName} onChange={(e) => setNewGroupName(e.target.value)} maxLength={64} spellCheck={false} />
@@ -361,7 +418,7 @@ export default function ChatPage({ auth, onLogout }) {
             <header>
               <div className="header-main">
                 <span className="prompt">
-                  {active.kind === 'dm' ? `🔒 #${active.username}` : `#${active.name}`}
+                  {active.kind === 'dm' ? `🔒 #${active.username}` : `🔒 #${active.name}`}
                 </span>
                 <span className="header-actions">
                   {active.kind === 'dm' && safety && (
@@ -404,7 +461,7 @@ export default function ChatPage({ auth, onLogout }) {
                   <span className="time">[{fmtTime(m.createdAt)}]</span>
                   <span className="nick">&lt;{m.senderUsername}&gt;</span>
                   {m.type === 'image'
-                    ? <AuthImage messageId={m.imageId} />
+                    ? <AuthImage messageId={m.imageId} username={auth.username} />
                     : <span className="content">{m.content}</span>}
                 </div>
               ))}
@@ -424,9 +481,7 @@ export default function ChatPage({ auth, onLogout }) {
                 spellCheck={false}
               />
               <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={sendImage} hidden />
-              {active.kind === 'group' && (
-                <button type="button" disabled={!connected} onClick={() => fileRef.current?.click()}>[img]</button>
-              )}
+              <button type="button" disabled={!connected} onClick={() => fileRef.current?.click()}>[img]</button>
               <button type="submit" disabled={!connected || !draft.trim()}>[send]</button>
             </form>
           </>

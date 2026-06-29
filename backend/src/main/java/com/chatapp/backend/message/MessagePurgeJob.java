@@ -21,12 +21,15 @@ public class MessagePurgeJob {
 
     private final MessageRepository messageRepository;
     private final MessageImageRepository imageRepository;
+    private final MessageKeyEnvelopeRepository envelopeRepository;
     private final Duration ttl;
 
     public MessagePurgeJob(MessageRepository messageRepository, MessageImageRepository imageRepository,
+                           MessageKeyEnvelopeRepository envelopeRepository,
                            @Value("${app.messages.ttl-hours}") long ttlHours) {
         this.messageRepository = messageRepository;
         this.imageRepository = imageRepository;
+        this.envelopeRepository = envelopeRepository;
         this.ttl = Duration.ofHours(ttlHours);
     }
 
@@ -34,7 +37,8 @@ public class MessagePurgeJob {
     @Transactional
     public void purgeExpired() {
         Instant cutoff = Instant.now().minus(ttl);
-        imageRepository.deleteForMessagesOlderThan(cutoff); // FK: images first
+        envelopeRepository.deleteForMessagesOlderThan(cutoff); // keyed by message id, drop first
+        imageRepository.deleteForMessagesOlderThan(cutoff);    // FK: images before messages
         int deleted = messageRepository.deleteOlderThan(cutoff);
         if (deleted > 0) {
             log.info("Purged {} expired messages", deleted);

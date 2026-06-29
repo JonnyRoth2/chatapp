@@ -5,6 +5,7 @@ import {
   generateIdentity, publicBundle, pickFetchBundle,
   initiatorStart, packMessage, unpackMessage,
 } from './src/crypto/session.js';
+import { sealContent, openContent, frameImage, unframeImage } from './src/crypto/content.js';
 
 let pass = 0, fail = 0;
 const enc = new TextEncoder();
@@ -82,6 +83,43 @@ try {
   initiatorStart(alice, badBundle);
 } catch { sigRejected = true; }
 check(sigRejected, 'forged signed-prekey signature is rejected');
+
+// ---- hybrid content encryption: group / image fan-out (server-blind) ----
+// Alice seals a payload ONCE under a content key, then wraps that key for each
+// recipient over their pairwise ratchet. Every recipient opens the same blob.
+const carol = generateIdentity(5);
+const carolFetch = pickFetchBundle(publicBundle(carol));
+const { state: aliceToCarol } = initiatorStart(alice, carolFetch);
+let carolState = null;
+
+const groupText = 'group hello — sealed once, opened by all';
+const sealed = sealContent(enc.encode(groupText));
+const envForBob = wire(packMessage(aliceState, sealed.cek));     // wrap CEK -> Bob
+const envForCarol = wire(packMessage(aliceToCarol, sealed.cek)); // wrap CEK -> Carol
+// the sealed blob travels as opaque bytes (base64 over the wire)
+const blobBytes = new Uint8Array(Buffer.from(Buffer.from(sealed.ciphertext).toString('base64'), 'base64'));
+
+const bobCek = unpackMessage(bobState, bob, envForBob).plaintext;
+const cr = unpackMessage(carolState, carol, envForCarol); carolState = cr.state;
+const carolCek = cr.plaintext;
+check(dec.decode(openContent(bobCek, blobBytes)) === groupText, 'bob opens group blob via his wrapped key');
+check(dec.decode(openContent(carolCek, blobBytes)) === groupText, 'carol opens same blob via her wrapped key');
+
+let wrongKeyRejected = false;
+try { openContent(carolCek.slice().fill(0), blobBytes); } catch { wrongKeyRejected = true; }
+check(wrongKeyRejected, 'a wrong/zeroed content key cannot open the blob (AEAD)');
+
+// ---- image framing: MIME type travels inside the ciphertext ----
+const imgBytes = new Uint8Array(512);
+for (let i = 0; i < imgBytes.length; i++) imgBytes[i] = (i * 13) & 0xff;
+const framed = sealContent(frameImage('image/png', imgBytes));
+const wrappedKey = wire(packMessage(aliceState, framed.cek));
+const recvCek = unpackMessage(bobState, bob, wrappedKey).plaintext;
+const opened = unframeImage(openContent(recvCek, framed.ciphertext));
+check(opened.contentType === 'image/png'
+  && opened.bytes.length === 512
+  && opened.bytes.every((v, i) => v === imgBytes[i]),
+  'image frame (type + bytes) round-trips through seal + wrapped key');
 
 console.log(`\n${fail === 0 ? 'ALL CRYPTO TESTS PASS' : 'CRYPTO TESTS FAILED'} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

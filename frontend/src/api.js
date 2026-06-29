@@ -37,11 +37,12 @@ export async function api(path, { method = 'GET', body } = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-/** Multipart upload (images). Content-Type is set by the browser. */
-export async function apiUpload(path, file) {
+/** Multipart upload (encrypted image bytes + extra form fields like key envelopes). */
+export async function apiUpload(path, file, fields = {}) {
   const auth = getAuth();
   const form = new FormData();
   form.append('file', file);
+  for (const [k, v] of Object.entries(fields)) form.append(k, v);
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: auth ? { Authorization: `Bearer ${auth.token}` } : {},
@@ -58,14 +59,14 @@ export async function apiUpload(path, file) {
   return res.json();
 }
 
-/** Fetch an image with the JWT and return an object URL (caller revokes). */
-export async function fetchImageObjectUrl(messageId) {
+/** Fetch encrypted image bytes with the JWT; caller decrypts with the content key. */
+export async function fetchImageBytes(messageId) {
   const auth = getAuth();
   const res = await fetch(`${API_BASE}/api/messages/image/${messageId}`, {
     headers: auth ? { Authorization: `Bearer ${auth.token}` } : {},
   });
   if (!res.ok) throw new Error(`Image failed to load (${res.status})`);
-  return URL.createObjectURL(await res.blob());
+  return new Uint8Array(await res.arrayBuffer());
 }
 
 const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
